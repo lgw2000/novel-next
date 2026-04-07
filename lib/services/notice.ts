@@ -1,0 +1,251 @@
+import {
+  permissionService as defaultPermissionService,
+  PermissionService,
+} from "@/lib/services/permission";
+import { noticeRepository as defaultNoticeRepository } from "@/lib/repositories/prisma/notice";
+import { boardRepository as defaultBoardRepository } from "@/lib/repositories/prisma/board";
+import {
+  NoticeRepository,
+  NoticeData,
+  CreateNoticeInput,
+  UpdateNoticeInput,
+} from "@/lib/repositories/interfaces/notice";
+import { BoardRepository } from "@/lib/repositories/interfaces/board";
+import {
+  PaginatedResult,
+  PaginationParams,
+  normalizePaginationParams,
+  createPaginatedResult,
+} from "@/lib/types/pagination";
+import { ServiceError, ServiceErrorCode } from "@/lib/services/errors";
+import { cached, invalidateCache, CACHE_TAGS } from "@/lib/cache";
+
+export class NoticeServiceError extends ServiceError {
+  constructor(
+    message: string,
+    code: ServiceErrorCode
+  ) {
+    super(message, code);
+    this.name = "NoticeServiceError";
+  }
+}
+
+export interface FindNoticeParams extends PaginationParams {
+  search?: string;
+}
+
+export interface NoticeService {
+  findByBoardId(
+    boardId: string,
+    options?: FindNoticeParams & { includeGlobal?: boolean }
+  ): Promise<PaginatedResult<NoticeData>>;
+  findPinnedAndRecent(boardId: string, recentCount?: number): Promise<NoticeData[]>;
+  findGlobal(options?: FindNoticeParams): Promise<PaginatedResult<NoticeData>>;
+  findById(id: number): Promise<NoticeData>;
+  create(userId: string, data: CreateNoticeInput): Promise<NoticeData>;
+  createGlobal(userId: string, data: Omit<CreateNoticeInput, "boardId">): Promise<NoticeData>;
+  update(userId: string, id: number, data: UpdateNoticeInput): Promise<NoticeData>;
+  delete(userId: string, id: number): Promise<NoticeData>;
+}
+
+interface NoticeServiceDeps {
+  noticeRepository: NoticeRepository;
+  boardRepository: BoardRepository;
+  permissionService: PermissionService;
+}
+
+export function createNoticeService(deps: NoticeServiceDeps): NoticeService {
+  const { noticeRepository, boardRepository, permissionService } = deps;
+
+  async function checkPermissions(
+    userId: string,
+    permissions: string[]
+  ): Promise<boolean> {
+    return permissionService.checkUserPermissions(userId, permissions);
+  }
+
+  return {
+    async findByBoardId(
+      boardId: string,
+      options?: FindNoticeParams & { includeGlobal?: boolean }
+    ): Promise<PaginatedResult<NoticeData>> {
+      const board = await boardRepository.findById(boardId);
+      if (!board || board.deleted) {
+        throw new NoticeServiceError("Board not found", "NOT_FOUND");
+      }
+
+      const { page, limit } = normalizePaginationParams(options ?? {});
+      const search = options?.search;
+      const includeGlobal = options?.includeGlobal;
+
+      // Single query optimization with window function
+      const { data, total } = await noticeRepository.findByBoardIdWithCount(
+        boardId,
+        { page, limit, search, includeGlobal }
+      );
+
+      return createPaginatedResult(data, total, page, limit);
+    },
+
+    async findPinnedAndRecent(
+      boardId: string,
+      recentCount: number = 3
+    ): Promise<NoticeData[]> {
+      const board = await boardRepository.findById(boardId);
+      if (!board || board.deleted) {
+        throw new NoticeServiceError("Board not found", "NOT_FOUND");
+      }
+
+      return cached(
+        async () => {
+          // Get all notices including global (limited), already ordered by pinned desc, createdAt desc
+          const notices = await noticeRepository.findByBoardId(boardId, { limit: 100, includeGlobal: true });
+
+          // Separate pinned (oldest first) and non-pinned (newest first)
+          const pinned = notices.filter((n) => n.pinned).reverse();
+          const nonPinned = notices.filter((n) => !n.pinned).slice(0, recentCount);
+
+          // Combine: all pinned + recent non-pinned (up to recentCount)
+          return [...pinned, ...nonPinned];
+        },
+        ["notices-pinned-recent", boardId, recentCount.toString()],
+        [CACHE_TAGS.notices, CACHE_TAGS.noticesByBoard(boardId), CACHE_TAGS.globalNotices]
+      );
+    },
+
+    async findGlobal(
+      options?: FindNoticeParams
+    ): Promise<PaginatedResult<NoticeData>> {
+      const { page, limit } = normalizePaginationParams(options ?? {});
+      const search = options?.search;
+
+      const { data, total } = await noticeRepository.findGlobalWithCount(
+        { page, limit, search }
+      );
+
+      return createPaginatedResult(data, total, page, limit);
+    },
+
+    async findById(id: number): Promise<NoticeData> {
+      const notice = await cached(
+        () => noticeRepository.findById(id),
+        ["notice", id.toString()],
+        [CACHE_TAGS.notices, CACHE_TAGS.notice(id)]
+      );
+      if (!notice || notice.deleted) {
+        throw new NoticeServiceError("Notice not found", "NOT_FOUND");
+      }
+      return notice;
+    },
+
+    async create(userId: string, data: CreateNoticeInput): Promise<NoticeData> {
+      if (data.boardId !== null) {
+        const board = await boardRepository.findById(data.boardId);
+        if (!board || board.deleted) {
+          throw new NoticeServiceError("Board not found", "NOT_FOUND");
+        }
+      }
+
+      const permissions = data.boardId !== null
+        ? ["notice:create", `notice:${data.boardId}:create`]
+        : ["notice:create"];
+      const hasPermission = await checkPermissions(userId, permissions);
+      if (!hasPermission) {
+        throw new NoticeServiceError("Permission denied", "FORBIDDEN");
+      }
+
+      const notice = await noticeRepository.create(data);
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.notices);
+      if (data.boardId !== null) {
+        invalidateCache(CACHE_TAGS.noticesByBoard(data.boardId));
+      }
+      invalidateCache(CACHE_TAGS.globalNotices);
+
+      return notice;
+    },
+
+    async createGlobal(
+      userId: string,
+      data: Omit<CreateNoticeInput, "boardId">
+    ): Promise<NoticeData> {
+      const hasPermission = await checkPermissions(userId, ["notice:create"]);
+      if (!hasPermission) {
+        throw new NoticeServiceError("Permission denied", "FORBIDDEN");
+      }
+
+      const notice = await noticeRepository.create({ ...data, boardId: null });
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.notices);
+      invalidateCache(CACHE_TAGS.globalNotices);
+
+      return notice;
+    },
+
+    async update(
+      userId: string,
+      id: number,
+      data: UpdateNoticeInput
+    ): Promise<NoticeData> {
+      const notice = await noticeRepository.findById(id);
+      if (!notice) {
+        throw new NoticeServiceError("Notice not found", "NOT_FOUND");
+      }
+
+      const permissions = notice.boardId !== null
+        ? ["notice:update", `notice:${notice.boardId}:update`]
+        : ["notice:update"];
+      const hasPermission = await checkPermissions(userId, permissions);
+      if (!hasPermission) {
+        throw new NoticeServiceError("Permission denied", "FORBIDDEN");
+      }
+
+      const result = await noticeRepository.update(id, data);
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.notices);
+      if (notice.boardId !== null) {
+        invalidateCache(CACHE_TAGS.noticesByBoard(notice.boardId));
+      }
+      invalidateCache(CACHE_TAGS.globalNotices);
+      invalidateCache(CACHE_TAGS.notice(id));
+
+      return result;
+    },
+
+    async delete(userId: string, id: number): Promise<NoticeData> {
+      const notice = await noticeRepository.findById(id);
+      if (!notice) {
+        throw new NoticeServiceError("Notice not found", "NOT_FOUND");
+      }
+
+      const permissions = notice.boardId !== null
+        ? ["notice:delete", `notice:${notice.boardId}:delete`]
+        : ["notice:delete"];
+      const hasPermission = await checkPermissions(userId, permissions);
+      if (!hasPermission) {
+        throw new NoticeServiceError("Permission denied", "FORBIDDEN");
+      }
+
+      const result = await noticeRepository.delete(id);
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.notices);
+      if (notice.boardId !== null) {
+        invalidateCache(CACHE_TAGS.noticesByBoard(notice.boardId));
+      }
+      invalidateCache(CACHE_TAGS.globalNotices);
+      invalidateCache(CACHE_TAGS.notice(id));
+
+      return result;
+    },
+  };
+}
+
+export const noticeService = createNoticeService({
+  noticeRepository: defaultNoticeRepository,
+  boardRepository: defaultBoardRepository,
+  permissionService: defaultPermissionService,
+});

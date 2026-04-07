@@ -1,0 +1,62 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# prisma
+/prisma/migrations
+*.db
+*.db-journal
+/app/generated/prisma
+
+# misc
+.DS_Store
+*.pem
+*.tsbuildinfo
+next-env.d.ts
+
+# editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+*~
+\#*\#
+.#*
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files
+.env*
+!.env.example
+
+# claude code local settings
+.claude/
+.gemini/
+
+# vercel
+.vercel
+
+# GeoIP database (downloaded at build time)
+lib/GeoLite2-Country.mmdb
+.mmdb-temp/

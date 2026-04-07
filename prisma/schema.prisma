@@ -1,0 +1,257 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// NextAuth.js Models
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? 
+  access_token      String? 
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? 
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model User {
+  id             String     @id @default(cuid())
+  name           String?
+  email          String?    @unique
+  emailVerified  DateTime?
+  image          String?
+  hashedPassword String?
+  accounts       Account[]
+  sessions       Session[]
+  userRoles      UserRole[]
+  threads        Thread[]
+  responses      Response[]
+  boards         Board[]    // Novels created by this user
+  
+  favoriteBoards  UserFavoriteBoard[]
+  favoriteAuthors UserFavoriteAuthor[] @relation("UserFollows")
+  followedBy      UserFavoriteAuthor[] @relation("UserFollowedBy")
+}
+
+model UserFavoriteBoard {
+  userId    String
+  boardId   String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  board     Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, boardId])
+}
+
+model UserFavoriteAuthor {
+  followerId String
+  authorId   String
+  follower   User     @relation("UserFollows", fields: [followerId], references: [id], onDelete: Cascade)
+  author     User     @relation("UserFollowedBy", fields: [authorId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@id([followerId, authorId])
+}
+
+// RBAC Models
+model Role {
+  id          String           @id @default(cuid())
+  name        String           @unique // ADMIN, SUB_ADMIN, USER
+  description String?
+  permissions RolePermission[]
+  users       UserRole[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+}
+
+model Permission {
+  id          String           @id @default(cuid())
+  name        String           @unique // e.g., "user:read", "user:write", "admin:manage"
+  description String?
+  deleted     Boolean          @default(false)
+  roles       RolePermission[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+}
+
+model UserRole {
+  id        String   @id @default(cuid())
+  userId    String
+  roleId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, roleId])
+  @@index([roleId])
+}
+
+model RolePermission {
+  id           String     @id @default(cuid())
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model GlobalSettings {
+  id              String   @id @default("default")
+  siteTitle       String   @default("OpenChamchiJS")
+  siteDescription String   @default("OpenChamchiJS - Open Source Forum")
+  countryCode     String   @default("KR") // ISO 3166-1 alpha-2 country code
+  homepageContent  String?  
+  customLinks      String?   // JSON array of {id, label, url}
+  indexCustomHtml  String?   // Custom HTML for board index pages (below notices)
+  threadCustomHtml String?   // Custom HTML for thread pages (above load more)
+  tripcodeSalt     String?  // bcrypt salt for tripcode generation
+  gaTrackingId     String?  // Google Analytics Measurement ID (G-XXXXXXXXXX)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model Board {
+  id                    String     @id
+  name                  String
+  defaultUsername       String
+  description           String?    // Novel synopsis/description
+  coverImage            String?    // Novel cover image URL
+  userId                String?    // Author of the novel
+  deleted               Boolean    @default(false)
+  maxResponsesPerThread Int        @default(1000)
+  blockForeignIp        Boolean    @default(false)
+  writeLocked           Boolean    @default(false)
+  responsesPerPage      Int        @default(50)
+  showUserCount         Boolean    @default(false)
+  threadsPerPage        Int        @default(20)
+  uploadMaxSize         Int        @default(5242880) // 5MB
+  uploadMimeTypes       String     @default("image/png,image/jpeg,image/gif,image/webp")
+  threadCount           Int        @default(0) // Counter cache: active threads (published && !deleted)
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+  threads               Thread[]
+  notices               Notice[]
+  responses             Response[]
+  user                  User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  favoritedBy           UserFavoriteBoard[]
+
+  @@index([userId])
+}
+
+model Notice {
+  id        Int      @id @default(autoincrement())
+  boardId   String?
+  title     String
+  content   String
+  pinned    Boolean  @default(false)
+  deleted   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  board     Board?   @relation(fields: [boardId], references: [id])
+
+  @@index([boardId, deleted, pinned, createdAt(sort: Desc)])
+}
+
+model Thread {
+  id            Int        @id @default(autoincrement())
+  boardId       String
+  title         String
+  password      String
+  username      String
+  userId        String?
+  ended         Boolean    @default(false)
+  deleted       Boolean    @default(false)
+  published     Boolean    @default(false)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @default(now())
+  top           Boolean    @default(false)
+  coverImage    String?
+  responseCount Int        @default(0)
+  responses     Response[]
+  bans          ThreadBan[]
+  board         Board      @relation(fields: [boardId], references: [id])
+  user          User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([boardId, published, deleted, top(sort: Desc), updatedAt(sort: Desc)])
+  @@index([userId])
+  
+  
+}
+
+model Response {
+  id         String   @id @default(cuid())
+  threadId   Int
+  boardId    String
+  seq        Int
+  username   String
+  authorId   String
+  userId     String?
+  ip         String
+  content    String
+  attachment String?
+  visible    Boolean  @default(true)
+  deleted    Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  thread     Thread   @relation(fields: [threadId], references: [id])
+  board      Board    @relation(fields: [boardId], references: [id])
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([threadId, seq])
+  @@index([threadId, deleted, visible, seq])
+  @@index([boardId, deleted, createdAt(sort: Desc)])
+  @@index([boardId, createdAt(sort: Desc), id(sort: Desc)])  // Admin responses (includeDeleted)
+  @@index([userId])
+}
+
+model ThreadBan {
+  id        String   @id @default(cuid())
+  threadId  Int
+  authorId  String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  thread    Thread   @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@unique([threadId, authorId])
+  @@index([threadId])
+}

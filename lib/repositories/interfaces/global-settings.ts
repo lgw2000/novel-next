@@ -1,0 +1,37 @@
+export interface CustomLink {
+  id: string;
+  label: string;
+  url: string;
+}
+
+export interface GlobalSettingsData {
+  id: string;
+  siteTitle: string;
+  siteDescription: string;
+  countryCode: string;
+  homepageContent: string | null;
+  customLinks: CustomLink[];
+  indexCustomHtml: string | null;
+  threadCustomHtml: string | null;
+  tripcodeSalt: string | null;
+  gaTrackingId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface UpdateGlobalSettingsInput {
+  siteTitle?: string;
+  siteDescription?: string | null;
+  countryCode?: string;
+  homepageContent?: string | null;
+  customLinks?: CustomLink[];
+  indexCustomHtml?: string | null;
+  threadCustomHtml?: string | null;
+  tripcodeSalt?: string | null;
+  gaTrackingId?: string | null;
+}
+
+export interface GlobalSettingsRepository {
+  get(): Promise<GlobalSettingsData>;
+  update(data: UpdateGlobalSettingsInput): Promise<GlobalSettingsData>;
+}

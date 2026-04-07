@@ -1,0 +1,483 @@
+import bcrypt from "bcryptjs";
+import {
+  permissionService as defaultPermissionService,
+  PermissionService,
+} from "@/lib/services/permission";
+import { responseRepository as defaultResponseRepository } from "@/lib/repositories/prisma/response";
+import { threadRepository as defaultThreadRepository } from "@/lib/repositories/prisma/thread";
+import { boardRepository as defaultBoardRepository } from "@/lib/repositories/prisma/board";
+import {
+  ResponseRepository,
+  ResponseData,
+  ResponseWithUser,
+  CreateResponseInput,
+  UpdateResponseInput,
+  ResponseFilter,
+  AdminResponseCursor,
+  ContentSearchCursor,
+} from "@/lib/repositories/interfaces/response";
+import { ThreadRepository } from "@/lib/repositories/interfaces/thread";
+import { BoardRepository } from "@/lib/repositories/interfaces/board";
+import { ServiceError, ServiceErrorCode } from "@/lib/services/errors";
+import { cached, invalidateCache, CACHE_TAGS } from "@/lib/cache";
+
+export class ResponseServiceError extends ServiceError {
+  constructor(
+    message: string,
+    code: ServiceErrorCode
+  ) {
+    super(message, code);
+    this.name = "ResponseServiceError";
+  }
+}
+
+export type ResponseRangeType =
+  | { type: "all" }
+  | { type: "recent"; limit: number }
+  | { type: "single"; seq: number }
+  | { type: "range"; startSeq: number; endSeq: number };
+
+export type SearchType = "username" | "authorId" | "email" | "content" | "ip";
+
+export interface FindByBoardIdResult {
+  data: ResponseWithUser[];
+  hasMore: boolean;
+  nextCursor: AdminResponseCursor | null;
+  scanned?: number;  // Only for content search
+}
+
+export interface ResponseService {
+  findByThreadId(
+    threadId: number,
+    options?: { limit?: number; offset?: number; includeDeleted?: boolean; includeHidden?: boolean; filter?: ResponseFilter }
+  ): Promise<ResponseData[]>;
+  findByRange(
+    threadId: number,
+    range: ResponseRangeType,
+    boardId?: string,
+    filter?: ResponseFilter
+  ): Promise<ResponseData[]>;
+  countByThreadId(threadId: number): Promise<number>;
+  findById(id: string): Promise<ResponseData>;
+  findByBoardId(
+    boardId: string,
+    options?: {
+      limit?: number;
+      searchType?: SearchType;
+      search?: string;
+      cursor?: AdminResponseCursor | null;
+      includeDeleted?: boolean;
+    }
+  ): Promise<FindByBoardIdResult>;
+  create(data: CreateResponseInput): Promise<ResponseData>;
+  update(
+    userId: string,
+    id: string,
+    data: UpdateResponseInput
+  ): Promise<ResponseData>;
+  updateWithPassword(
+    id: string,
+    password: string,
+    data: { visible?: boolean }
+  ): Promise<ResponseData>;
+  delete(
+    userId: string | null,
+    id: string,
+    password?: string
+  ): Promise<ResponseData>;
+}
+
+interface ResponseServiceDeps {
+  responseRepository: ResponseRepository;
+  threadRepository: ThreadRepository;
+  boardRepository: BoardRepository;
+  permissionService: PermissionService;
+}
+
+export function createResponseService(deps: ResponseServiceDeps): ResponseService {
+  const { responseRepository, threadRepository, boardRepository, permissionService } = deps;
+
+  async function checkResponsePermission(
+    userId: string | null,
+    boardId: string,
+    action: "update" | "delete"
+  ): Promise<boolean> {
+    if (!userId) return false;
+
+    return permissionService.checkUserPermissions(userId, [
+      `response:${action}`,
+      `response:${boardId}:${action}`,
+    ]);
+  }
+
+  async function verifyThreadPassword(
+    threadId: number,
+    password?: string
+  ): Promise<boolean> {
+    if (!password) return false;
+    const thread = await threadRepository.findById(threadId);
+    if (!thread) return false;
+    return bcrypt.compare(password, thread.password);
+  }
+
+  return {
+    async findByThreadId(
+      threadId: number,
+      options?: { limit?: number; offset?: number; includeDeleted?: boolean; includeHidden?: boolean; filter?: ResponseFilter }
+    ): Promise<ResponseData[]> {
+      const thread = await threadRepository.findById(threadId);
+      if (!thread || thread.deleted) {
+        throw new ResponseServiceError("Thread not found", "NOT_FOUND");
+      }
+
+      return responseRepository.findByThreadId(threadId, options);
+    },
+
+    async findByRange(
+      threadId: number,
+      range: ResponseRangeType,
+      boardId?: string,
+      filter?: ResponseFilter
+    ): Promise<ResponseData[]> {
+      const thread = await threadRepository.findById(threadId);
+      if (!thread || thread.deleted || !thread.published) {
+        throw new ResponseServiceError("Thread not found", "NOT_FOUND");
+      }
+      if (boardId && thread.boardId !== boardId) {
+        throw new ResponseServiceError("Thread not found", "NOT_FOUND");
+      }
+
+      const fetchResponses = async () => {
+        switch (range.type) {
+          case "all":
+            return responseRepository.findByThreadId(threadId, { limit: 10000, filter });
+          case "recent":
+            return responseRepository.findRecentByThreadId(threadId, {
+              limit: range.limit,
+              filter,
+            });
+          case "single": {
+            // Always include seq 0 (thread body) plus the requested seq
+            const responses: ResponseData[] = [];
+            const [firstResponse, singleResponse] = await Promise.all([
+              responseRepository.findByThreadIdAndSeq(threadId, 0),
+              range.seq === 0
+                ? Promise.resolve(null)
+                : responseRepository.findByThreadIdAndSeq(threadId, range.seq),
+            ]);
+            if (firstResponse && !firstResponse.deleted && firstResponse.visible) {
+              responses.push(firstResponse);
+            }
+            if (singleResponse && !singleResponse.deleted && singleResponse.visible) {
+              responses.push(singleResponse);
+            }
+            return responses;
+          }
+          case "range": {
+            // If range doesn't include 0, we need to fetch it separately
+            if (range.startSeq > 0) {
+              const [firstResponse, rangeResponses] = await Promise.all([
+                responseRepository.findByThreadIdAndSeq(threadId, 0),
+                responseRepository.findByThreadIdAndSeqRange(threadId, {
+                  startSeq: range.startSeq,
+                  endSeq: range.endSeq,
+                  filter,
+                }),
+              ]);
+              const responses: ResponseData[] = [];
+              if (firstResponse && !firstResponse.deleted && firstResponse.visible) {
+                responses.push(firstResponse);
+              }
+              responses.push(...rangeResponses);
+              return responses;
+            }
+            return responseRepository.findByThreadIdAndSeqRange(threadId, {
+              startSeq: range.startSeq,
+              endSeq: range.endSeq,
+              filter,
+            });
+          }
+        }
+      };
+
+      return fetchResponses();
+    },
+
+    async countByThreadId(threadId: number): Promise<number> {
+      return responseRepository.countByThreadId(threadId);
+    },
+
+    async findById(id: string): Promise<ResponseData> {
+      const response = await responseRepository.findById(id);
+      if (!response || response.deleted) {
+        throw new ResponseServiceError("Response not found", "NOT_FOUND");
+      }
+      return response;
+    },
+
+    async findByBoardId(
+      boardId: string,
+      options?: {
+        limit?: number;
+        searchType?: SearchType;
+        search?: string;
+        cursor?: AdminResponseCursor | null;
+        includeDeleted?: boolean;
+      }
+    ): Promise<FindByBoardIdResult> {
+      const { limit = 100, searchType, search, cursor, includeDeleted = false } = options ?? {};
+
+      // Content search uses chunked cursor-based search (with scanned count)
+      if (searchType === "content" && search) {
+        // Convert AdminResponseCursor to ContentSearchCursor if present
+        const contentCursor: ContentSearchCursor | null = cursor
+          ? { createdAt: cursor.createdAt, id: cursor.id, scanned: 0 }
+          : null;
+        const result = await responseRepository.findByBoardIdChunked(
+          boardId,
+          search,
+          { limit, cursor: contentCursor, includeDeleted }
+        );
+        return {
+          data: result.data,
+          hasMore: result.hasMore,
+          nextCursor: result.nextCursor
+            ? { createdAt: result.nextCursor.createdAt, id: result.nextCursor.id }
+            : null,
+          scanned: result.scanned,
+        };
+      }
+
+      // Other searches use cursor-based pagination
+      const filter = searchType && search ? { [searchType]: search } : undefined;
+
+      const result = await responseRepository.findByBoardIdCursor(boardId, {
+        limit,
+        cursor,
+        includeDeleted,
+        filter,
+      });
+
+      return {
+        data: result.data,
+        hasMore: result.hasMore,
+        nextCursor: result.nextCursor,
+      };
+    },
+
+    async create(data: CreateResponseInput): Promise<ResponseData> {
+      const thread = await threadRepository.findById(data.threadId);
+      if (!thread || thread.deleted) {
+        throw new ResponseServiceError("Thread not found", "NOT_FOUND");
+      }
+
+      const board = await boardRepository.findById(thread.boardId);
+      if (!board) {
+        throw new ResponseServiceError("Board not found", "NOT_FOUND");
+      }
+
+      // --- Novel Platform Custom: Forced Anonymity for Readers ---
+      // If the creator is not the author (userId matches board.userId), force the name to "익명"
+      if (data.authorId !== board.userId) {
+        data.username = "익명";
+      }
+      // ---------------------------------------------------------
+
+      // --- Novel Platform Custom Commands ---
+      let commandAppended = "";
+      if (data.content.includes('/stop')) {
+        await (threadRepository as any).update(data.threadId, { ended: true });
+        commandAppended += "\n\n[clr red][bld]이 소설은 연재가 중단되었습니다.[/bld][/clr]";
+        thread.ended = true;
+      } else if (data.content.includes('/start')) {
+        await (threadRepository as any).update(data.threadId, { ended: false });
+        commandAppended += "\n\n[clr blue][bld]연재가 재개되었습니다.[/bld][/clr]";
+        thread.ended = false;
+      }
+
+      const diceRegex = /\/dice\s+(\d+)d(\d+)/gi;
+      if (diceRegex.test(data.content)) {
+        data.content = data.content.replace(diceRegex, (match, countStr, sidesStr) => {
+          const count = parseInt(countStr);
+          const sides = parseInt(sidesStr);
+          if (count > 100 || sides > 1000) return match + " (범위 초과)";
+          let sum = 0;
+          let rolls = [];
+          for(let i=0; i<count; i++){
+            const r = Math.floor(Math.random() * sides) + 1;
+            sum += r;
+            rolls.push(r);
+          }
+          return `[bld][다이스: ${match} 🎲 결과: ${sum} (${rolls.join(", ")})][/bld]`;
+        });
+      }
+      data.content += commandAppended;
+      // ----------------------------------------
+
+      if (thread.ended) {
+        throw new ResponseServiceError("Thread is ended", "BAD_REQUEST");
+      }
+
+      // Check maxResponsesPerThread limit
+      // maxResponsesPerThread means max seq value (0-indexed)
+      // So if maxResponsesPerThread is 1000, we allow seq 0~1000 (1001 total responses)
+      const currentCount = await responseRepository.countByThreadId(data.threadId);
+      if (currentCount > board.maxResponsesPerThread) {
+        throw new ResponseServiceError("Thread has reached maximum responses", "BAD_REQUEST");
+      }
+
+      // Extract noup flag before passing to repository (repository doesn't need it)
+      const { noup, ...repoData } = data;
+      const response = await responseRepository.create({
+        ...repoData,
+        boardId: thread.boardId,
+      });
+
+      // If this response reaches the max limit, end the thread
+      // seq starts from 0, so seq == maxResponsesPerThread means we have maxResponsesPerThread + 1 responses
+      if (response.seq >= board.maxResponsesPerThread) {
+        await (threadRepository as any).update(data.threadId, { ended: true });
+      } else if (!noup) {
+        // 새 응답 추가 시 스레드 범프 (noup이 아닌 경우에만)
+        await (threadRepository as any).updateBumpTime(data.threadId);
+      }
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.responses(data.threadId));
+      invalidateCache(CACHE_TAGS.thread(data.threadId));
+      invalidateCache(CACHE_TAGS.threadsByBoard(thread.boardId));
+
+      return response;
+    },
+
+    async update(
+      userId: string,
+      id: string,
+      data: UpdateResponseInput
+    ): Promise<ResponseData> {
+      const response = await responseRepository.findById(id);
+      if (!response) {
+        throw new ResponseServiceError("Response not found", "NOT_FOUND");
+      }
+
+      // If response is deleted, only allow restoring (setting deleted to false)
+      if (response.deleted && data.deleted !== false) {
+        throw new ResponseServiceError("Response not found", "NOT_FOUND");
+      }
+
+      // seq 0 (thread body) cannot be modified via response API
+      if (response.seq === 0 && (data.visible !== undefined || data.deleted !== undefined)) {
+        throw new ResponseServiceError("Cannot modify thread body response", "BAD_REQUEST");
+      }
+
+      const thread = await threadRepository.findById(response.threadId);
+      if (!thread) {
+        throw new ResponseServiceError("Thread not found", "NOT_FOUND");
+      }
+
+      const board = await boardRepository.findById(thread.boardId);
+
+      // Permitted if: Admin, Board Owner (Mod), or Response Author (Self-edit)
+      const hasPermission = (board?.userId === userId) 
+        || (response.authorId === userId) 
+        || await checkResponsePermission(userId, thread.boardId, "update");
+      
+      if (!hasPermission) {
+        throw new ResponseServiceError("Permission denied", "FORBIDDEN");
+      }
+
+      const result = await responseRepository.update(id, data);
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.responses(response.threadId));
+      invalidateCache(CACHE_TAGS.thread(response.threadId));
+
+      return result;
+    },
+
+    async updateWithPassword(
+      id: string,
+      password: string,
+      data: { visible?: boolean }
+    ): Promise<ResponseData> {
+      const response = await responseRepository.findById(id);
+      if (!response) {
+        throw new ResponseServiceError("Response not found", "NOT_FOUND");
+      }
+
+      // seq 0 (thread body) cannot be modified via response API
+      if (response.seq === 0) {
+        throw new ResponseServiceError("Cannot modify thread body response", "BAD_REQUEST");
+      }
+
+      // Password holders can restore hidden responses, so we don't check response.deleted here
+      // But they cannot restore deleted responses (deleted can only be managed by admins)
+      if (response.deleted) {
+        throw new ResponseServiceError("Response not found", "NOT_FOUND");
+      }
+
+      const passwordValid = await verifyThreadPassword(response.threadId, password);
+      if (!passwordValid) {
+        throw new ResponseServiceError("Invalid password", "FORBIDDEN");
+      }
+
+      const result = await responseRepository.update(id, { visible: data.visible });
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.responses(response.threadId));
+
+      return result;
+    },
+
+    async delete(
+      userId: string | null,
+      id: string,
+      password?: string
+    ): Promise<ResponseData> {
+      const response = await responseRepository.findById(id);
+      if (!response || response.deleted) {
+        throw new ResponseServiceError("Response not found", "NOT_FOUND");
+      }
+
+      // seq 0 (thread body) cannot be deleted via response API
+      if (response.seq === 0) {
+        throw new ResponseServiceError("Cannot delete thread body response", "BAD_REQUEST");
+      }
+
+      const thread = await threadRepository.findById(response.threadId);
+      if (!thread) {
+        throw new ResponseServiceError("Thread not found", "NOT_FOUND");
+      }
+
+      const board = await boardRepository.findById(thread.boardId);
+
+      // Permitted if:
+      // 1. Response author (Self-deletion) - Compare UUIDs if logged in
+      // 2. Admin / Global permissions (e.g. system moderation)
+      // 3. Thread password holds (guest role)
+      const hasPermission = (userId && response.userId === userId)
+        || await checkResponsePermission(userId, thread.boardId, "delete");
+      
+      const passwordValid = await verifyThreadPassword(response.threadId, password);
+
+      if (!hasPermission && !passwordValid) {
+        throw new ResponseServiceError("Permission denied", "FORBIDDEN");
+      }
+
+      const result = await responseRepository.delete(id);
+
+      // Invalidate cache
+      invalidateCache(CACHE_TAGS.responses(response.threadId));
+      invalidateCache(CACHE_TAGS.thread(response.threadId));
+
+      return result;
+    },
+  };
+}
+
+export const responseService = createResponseService({
+  responseRepository: defaultResponseRepository,
+  threadRepository: defaultThreadRepository,
+  boardRepository: defaultBoardRepository,
+  permissionService: defaultPermissionService,
+});

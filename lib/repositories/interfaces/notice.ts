@@ -1,0 +1,49 @@
+import { PaginationParams } from "@/lib/types/pagination";
+
+export interface NoticeData {
+  id: number;
+  boardId: string | null;
+  title: string;
+  content: string;
+  pinned: boolean;
+  deleted: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface CreateNoticeInput {
+  boardId: string | null;
+  title: string;
+  content: string;
+  pinned?: boolean;
+}
+
+export interface UpdateNoticeInput {
+  title?: string;
+  content?: string;
+  pinned?: boolean;
+  deleted?: boolean;
+}
+
+export interface FindNoticeOptions extends PaginationParams {
+  includeDeleted?: boolean;
+  includeGlobal?: boolean;
+  search?: string;
+}
+
+export interface FindByBoardIdWithCountResult {
+  data: NoticeData[];
+  total: number;
+}
+
+export interface NoticeRepository {
+  findByBoardId(boardId: string, options?: FindNoticeOptions): Promise<NoticeData[]>;
+  findByBoardIdWithCount(boardId: string, options?: FindNoticeOptions): Promise<FindByBoardIdWithCountResult>;
+  countByBoardId(boardId: string, options?: { includeDeleted?: boolean; search?: string }): Promise<number>;
+  findGlobal(options?: FindNoticeOptions): Promise<NoticeData[]>;
+  findGlobalWithCount(options?: FindNoticeOptions): Promise<FindByBoardIdWithCountResult>;
+  findById(id: number): Promise<NoticeData | null>;
+  create(data: CreateNoticeInput): Promise<NoticeData>;
+  update(id: number, data: UpdateNoticeInput): Promise<NoticeData>;
+  delete(id: number): Promise<NoticeData>;
+}
