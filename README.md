@@ -5,7 +5,6 @@
 
 Next.js 15+ 기반의 AA(ascii art) 웹소설 연재 및 열람 플랫폼입니다. [OpenChamchiJS](https://github.com/tunaground/OpenChamchiJS)를 사용하여 바이브 코딩으로 만들었습니다.
 
-Next.js 15+ 기반의 AA(ascii art) 웹소설 연재 및 열람 플랫폼입니다. OpenChamchiJS의 백엔드 아키텍처를 계승하여 빠르고 안정적인 서비스 환경을 제공합니다.
 
 
 ## 주요 기능
